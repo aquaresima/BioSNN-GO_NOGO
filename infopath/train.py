@@ -1,6 +1,7 @@
 import torch
 import numpy as np
 import os
+import time
 from optparse import OptionParser
 from datasets.dataloader import balance_trial_type, keep_trial_types_behaviour
 from infopath.model_loader import load_model_and_optimizer
@@ -12,10 +13,12 @@ from infopath.utils.functions import (
     trial_metric,
     trial_type_perc,
 )
-from infopath.utils.logger import get_log_path, init_results, log_model_and_results_gan
+from infopath.utils.logger import get_log_path, init_results, log_model_and_results_gan, optimizer_to
 from infopath.utils.plot_utils import plot_rsnn_activity
 from infopath.lick_classifier import prepare_classifier
 from infopath.losses import discriminator_loss, find_important_elements
+from infopath.utils.online_logger import OnlineLogger
+from infopath.utils.diagnostics import DiagnosticsLogger, count_trainable_parameters, Timer
 
 # import wandb
 
@@ -40,7 +43,29 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
         "t_trial_pearson": [],
         "tm_mle_loss": [],
         "data_loss": [],
+        "dt_forward": [],
+        "dt_backward": [],
+        "dt_step": [],
     }
+
+    # ---- diagnostics logger: log JSONL con todo lo que se pueda para
+    # inspeccionar el training (actividad de neuronas, pesos activos, timing) ----
+    diag_logger = DiagnosticsLogger(opt.log_path, step_every=50, flush_every=1)
+    count_trainable_parameters(model, verbose=True)
+    online = OnlineLogger(opt, name=os.path.basename(opt.log_path))
+    diag_logger.log(
+        step=step,
+        model=model,
+        log_params=True,
+        extra={"event": "train_start"},
+    )
+
+    if opt.with_behaviour:
+        raise NotImplementedError(
+            "with_behaviour=True is not supported for the Pierre data yet: lick_classifier.prepare_classifier "
+            "needs lick_counts_train/test (never computed), pierre/process.py writes no whisker/tongue traces, "
+            "and the lick traces are 1 kHz while dataloader.py assumes 500 Hz."
+        )
     if opt.iterative_pruning:
         init_pruning(model)
     # load data and prepare lick_classifier
@@ -57,6 +82,10 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
         prepare_svd_feat(model, filt)
     stim_cond = [opt.trial_types]
     log_step = opt.log_every_n_steps - (opt.log_every_n_steps % len(stim_cond))
+    if getattr(opt, "resume", False) and results["test_loss"]:
+        step = len(results["test_loss"]) * log_step - 1
+        previous_test_loss = min(results["test_loss"])
+        print(f"resuming at step {step + 1} (previous best test loss {previous_test_loss:.4f})")
 
     data_spikes = train_spikes.clone()
     data_jaw = None
@@ -149,74 +178,94 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
         ## Train generator, the last condition is for go_back_to_hunting
         if not opt.gan_loss or step % 1 == 0 or step % log_step == 1:
             # Train Generator]
-            optimizerG.zero_grad()
-            model.zero_grad()
-            model_spikes, volt, model_jaw, state = model(stims, step)
-            if model_spikes.min().isnan():
-                model, netD, optimizerG, optimizerD, life, step = explosion_reset(
-                    opt, life, step
+            grad_norm = None
+            with Timer(opt.device) as t_fwd:
+                optimizerG.zero_grad()
+                model.zero_grad()
+                model_spikes, volt, model_jaw, state = model(stims, step)
+                if model_spikes.min().isnan():
+                    diag_logger.log(
+                        step=step, extra={"event": "explosion_reset", "life": life}
+                    )
+                    model, netD, optimizerG, optimizerD, life, step = explosion_reset(
+                        opt, life, step
+                    )
+                    to_save_lists = {i: [] for i in to_save_lists.keys()}
+                    continue
+                (
+                    fr_loss,
+                    trial_loss,
+                    neuron_loss,
+                    cross_corr_loss,
+                    tm_mle_loss,
+                ) = model.generator_loss(
+                    model_spikes,
+                    data_spikes,
+                    model_jaw,
+                    data_jaw,
+                    session_info,
+                    netD,
+                    stims=stims,
                 )
-                to_save_lists = {i: [] for i in to_save_lists.keys()}
-                continue
-            (
-                fr_loss,
-                trial_loss,
-                neuron_loss,
-                cross_corr_loss,
-                tm_mle_loss,
-            ) = model.generator_loss(
-                model_spikes,
-                data_spikes,
-                model_jaw,
-                data_jaw,
-                session_info,
-                netD,
-            )
 
-            if opt.loss_mem_volt:
-                mem_loss = (((volt - model.rsnn.v_rest) / thr_rest) ** 2).mean() ** 0.5
+                if opt.loss_mem_volt:
+                    mem_loss = (
+                        ((volt - model.rsnn.v_rest) / thr_rest) ** 2
+                    ).mean() ** 0.5
 
-            conn_loss = 0
-            across = model.rsnn.off_diag.to(opt.device)
-            # for teacher only to set the shape connection
-            if "2areas_abstract" in opt.datapath and opt.block_graph == []:
-                area1 = model.rsnn.area_index == 0
-                area2 = model.rsnn.area_index == 1
-                connection_strength_going = across.clone()
-                connection_strength_going[:, area2] = 0
-                connection_strength_coming = across.clone()
-                connection_strength_coming[:, area1] = 0
-                conn_going = model.rsnn._w_rec[:, connection_strength_going].sum()
-                conn_coming = model.rsnn._w_rec[:, connection_strength_coming].sum()
-                conn_loss = 0.1 * (conn_going / opt.diff_strength - conn_coming).abs()
+                conn_loss = 0
+                across = model.rsnn.off_diag.to(opt.device)
+                # for teacher only to set the shape connection
+                if "2areas_abstract" in opt.datapath and opt.block_graph == []:
+                    area1 = model.rsnn.area_index == 0
+                    area2 = model.rsnn.area_index == 1
+                    connection_strength_going = across.clone()
+                    connection_strength_going[:, area2] = 0
+                    connection_strength_coming = across.clone()
+                    connection_strength_coming[:, area1] = 0
+                    conn_going = model.rsnn._w_rec[:, connection_strength_going].sum()
+                    conn_coming = model.rsnn._w_rec[:, connection_strength_coming].sum()
+                    conn_loss = 0.1 * (
+                        conn_going / opt.diff_strength - conn_coming
+                    ).abs()
 
-            total_train_loss = (
-                neuron_loss
-                + trial_loss
-                + fr_loss
-                + cross_corr_loss
-                + tm_mle_loss
-                + mem_loss
-                + conn_loss
-            )
-            total_train_loss.backward()
+                total_train_loss = (
+                    neuron_loss
+                    + trial_loss
+                    + fr_loss
+                    + cross_corr_loss
+                    + tm_mle_loss
+                    + mem_loss
+                    + conn_loss
+                )
+            dt_forward = t_fwd.dt
+
+            with Timer(opt.device) as t_bwd:
+                total_train_loss.backward()
+            dt_backward = t_bwd.dt
+
             if opt.clip_grad:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), opt.clip_grad)
-            w_rec = model.rsnn._w_rec.data.clone()
-            if opt.with_behaviour:
-                w_jaw = model.rsnn._w_jaw_pre.data.clone()
-            else:
-                w_jaw = 0
-            w_in = model.rsnn._w_in.data.clone()
-            optimizerG.step()
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), opt.clip_grad
+                )
 
-            with torch.no_grad():
-                weight_decay(model, w_rec, w_jaw, w_in)
-                if opt.flag_ei:
-                    model.rsnn.reform_recurent(opt.lr, l1_decay=0)
-                if not opt.flag_ei and opt.restrict_inter_area_inh:
-                    model.rsnn._w_rec.data *= model.rsnn.mask_inter_inh_exc
-                model.rsnn.reform_v_rest()
+            with Timer(opt.device) as t_step:
+                w_rec = model.rsnn._w_rec.data.clone()
+                if opt.with_behaviour:
+                    w_jaw = model.rsnn._w_jaw_pre.data.clone()
+                else:
+                    w_jaw = 0
+                w_in = model.rsnn._w_in.data.clone()
+                optimizerG.step()
+
+                with torch.no_grad():
+                    weight_decay(model, w_rec, w_jaw, w_in)
+                    if opt.flag_ei:
+                        model.rsnn.reform_recurent(opt.lr, l1_decay=0)
+                    if not opt.flag_ei and opt.restrict_inter_area_inh:
+                        model.rsnn._w_rec.data *= model.rsnn.mask_inter_inh_exc
+                    model.rsnn.reform_v_rest()
+            dt_step = t_step.dt
 
             if (step % log_step == 1) & opt.iterative_pruning:
                 iterative_pruning(model)
@@ -255,8 +304,47 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
         to_save_lists["cross_corr_loss"].append(float(cross_corr_loss))
         to_save_lists["tm_mle_loss"].append(float(tm_mle_loss))
         to_save_lists["data_loss"].append(float(total_train_loss - conn_loss))
+        to_save_lists["dt_forward"].append(dt_forward)
+        to_save_lists["dt_backward"].append(dt_backward)
+        to_save_lists["dt_step"].append(dt_step)
         if t_trial_pearson_model != 0:
             to_save_lists["t_trial_pearson"].append(float(t_trial_pearson_model))
+
+        # ---- diagnostics: log ligero cada step, stats caras (actividad de
+        # neuronas / pesos activos) cada `step_every` steps (ver DiagnosticsLogger) ----
+        diag_logger.log(
+            step=step,
+            model=model,
+            model_spikes=model_spikes,
+            extra={
+                "epoch": step // log_step,
+                "total_train_loss": float(total_train_loss),
+                "neuron_loss": float(neuron_loss),
+                "trial_loss": float(trial_loss),
+                "fr_loss": float(fr_loss),
+                "cross_corr_loss": float(cross_corr_loss),
+                "grad_norm": float(grad_norm) if grad_norm is not None else None,
+                "lr": optimizerG.param_groups[0]["lr"],
+                "dt_forward": dt_forward,
+                "dt_backward": dt_backward,
+                "dt_step": dt_step,
+            },
+        )
+
+        online.log(
+            {
+                "total_train_loss": float(total_train_loss),
+                "neuron_loss": float(neuron_loss),
+                "trial_loss": float(trial_loss),
+                "grad_norm": float(grad_norm) if grad_norm is not None else None,
+                "dt_forward": dt_forward,
+                "dt_backward": dt_backward,
+                "gpu_peak_gb": torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None,
+            },
+            step,
+        )
+        if step % log_step == 0 and torch.cuda.is_available():
+            print(f"gpu peak allocated so far: {torch.cuda.max_memory_allocated() / 2**30:.1f} GB")
 
         if step % log_step == 0:
             torch.cuda.empty_cache()
@@ -265,7 +353,7 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
                 if "Vahid" in opt.datapath:
                     opt.batch_size = opt.batch_size
                 else:
-                    opt.batch_size = 400
+                    opt.batch_size = getattr(opt, "eval_batch_size", 400)
                 # torch.manual_seed(0)
                 stims = all_stims[
                     torch.randint(all_stims.shape[0], size=(opt.batch_size,))
@@ -300,6 +388,8 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
                     test_loss,
                     trial_type_acc,
                     t_trial_pearson_ratio,
+                    eval_trial_type,
+                    eval_model_perc,
                 ) = goodness_of_fit(
                     test_spikes,
                     model_spikes,
@@ -320,11 +410,43 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
                         f"trial type accuracy {trial_type_acc} ratio of t_trial_test/t_trial_data {t_trial_pearson_ratio}"
                     )
 
+            online.log_eval(
+                step, model, model_spikes, test_spikes, stims,
+                eval_trial_type, eval_model_perc, data_perc,
+            )
             results["trial_type_accuracy"].append(trial_type_acc)
             results["t_trial_pearson_ratio"].append(t_trial_pearson_ratio.item())
             for key in to_save_lists.keys():
                 results[key].append(np.mean(to_save_lists[key]))
             results["test_loss"].append(test_loss)
+            online.log(
+                {
+                    "test_loss": float(test_loss),
+                    "trial_type_accuracy": float(trial_type_acc),
+                    "t_trial_pearson_ratio": float(t_trial_pearson_ratio.item()),
+                },
+                step,
+            )
+
+            # ---- diagnostics: entrada de eval, usa el batch de test para
+            # stats de actividad neuronal completas (force_full=True: el eval
+            # solo corre cada log_step steps, así que es barato hacerlo siempre) ----
+            diag_logger.log(
+                step=step,
+                model=model,
+                model_spikes=model_spikes,
+                force_full=True,
+                extra={
+                    "event": "eval",
+                    "test_loss": float(test_loss),
+                    "trial_type_accuracy": float(trial_type_acc),
+                    "t_trial_pearson_ratio": float(t_trial_pearson_ratio.item()),
+                    "early_stop_counter": early_stop,
+                    "mean_dt_forward_epoch": float(results["dt_forward"][-1]),
+                    "mean_dt_backward_epoch": float(results["dt_backward"][-1]),
+                    "mean_dt_step_epoch": float(results["dt_step"][-1]),
+                },
+            )
 
             best_loss = "data_loss" if "Vahid" in opt.datapath else "test_loss"
             log_model_and_results_gan(
@@ -345,6 +467,7 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
                 if early_stop > opt.early_stop:
                     print("probably pointless to continue so I stop myself")
                     print("So long, and thanks for the fish")
+                    diag_logger.close()
                     return -1
             else:
                 previous_test_loss = results[best_loss][-1]
@@ -362,6 +485,7 @@ def train(opt, model, netD, optimizerG, optimizerD, step=-1):
             # wandb.log(entry)
         early_stop += 1
     print("So long, and thanks for the fish")
+    diag_logger.close()
     return -1
 
 
@@ -549,7 +673,7 @@ def goodness_of_fit(
         cross_corr_loss,
         tm_mle_loss,
     ) = model.generator_loss(
-        model_spikes, data_spikes, model_jaw, data_jaw, session_info, netD
+        model_spikes, data_spikes, model_jaw, data_jaw, session_info, netD, stims=stims
     )
     filt_model = model.filter_fun1(model_spikes)
     filt_data = model.filter_fun1(data_spikes)
@@ -590,7 +714,7 @@ def goodness_of_fit(
     t_trial_pearson_ratio = t_trial_pearson_test / t_trial_pearson_data
     print("t_trial_pearson: ", t_trial_pearson_test)
 
-    return test_loss, acc_trial_type, t_trial_pearson_ratio
+    return test_loss, acc_trial_type, t_trial_pearson_ratio, trial_type, model_perc
 
 
 def test_hit_miss(data_spikes, session_info, trial_type=1):
@@ -649,21 +773,22 @@ if __name__ == "__main__":
     # if there is no arg in the parser then is what is currently the default in the infopath/config.py
     parser = OptionParser()
     parser.add_option("--config", type="string", default="none")
+    parser.add_option("--resume", type="string", default=None,
+                      help="log_path of a previous run: reload last_model/last_optim and continue")
     (pars, _) = parser.parse_args()
 
     if pars.config == "none":
         opt = config_pseudodata()
-        # config = "grid_Vahid/l1across0_seed0"
-        config = "grid_nofb/l1across200_seed0_nospike"
-        # config = "teacher_conf"
+        config = "daniel"
         opt = get_opt(os.path.join("configs", config))
-        # config = "l1across01_spiking"
-        # opt = get_opt(os.path.join("configs", "grid", "l1across01_spiking"))
         if "/" in config:
             config = config.split("/")[-1]
         get_log_path(opt, config)
     else:
         opt = get_opt(os.path.join("configs", pars.config))
+        if pars.resume:
+            opt.log_path = os.path.abspath(pars.resume)
+            opt.resume = True
         config = pars.config
         if "/" in config:
             config = config.split("/")[-1]
@@ -676,10 +801,6 @@ if __name__ == "__main__":
         print("log_path", opt.log_path)
 
     git_diff(opt.log_path)
-
-    # if pars.config != "none":
-    #     os.mkdir(os.path.join(opt.log_path, pars.config))
-    #     save_opt(os.path.join(opt.log_path, pars.config), opt)
 
     # set random seeds
     if opt.seed >= 0:
@@ -694,9 +815,15 @@ if __name__ == "__main__":
         else torch.device("cpu")
     )
     opt.device = torch.device("cpu")
-    model, netD, optimizerG, optimizerD = load_model_and_optimizer(opt)
+    model, netD, optimizerG, optimizerD = load_model_and_optimizer(
+        opt, reload=getattr(opt, "resume", False)
+    )
     opt.device = dev
     model.to(opt.device)
+    # optimizer state loaded on resume was placed on the CPU (opt.device was cpu during loading)
+    optimizer_to(optimizerG, opt.device)
+    if optimizerD is not None:
+        optimizer_to(optimizerD, opt.device)
     if netD is not None:
         netD.to(opt.device)
     # wandb.init(project="infopath", config=opt)

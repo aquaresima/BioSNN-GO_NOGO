@@ -15,12 +15,12 @@ def get_log_path(opt, model_path=""):
     curr_commit = get_commit_path()
     root_path = os.path.join(root_path, curr_commit)
     if not os.path.exists(root_path):
-        os.mkdir(root_path)
+        os.makedirs(root_path, exist_ok=True)
     now = datetime.datetime.now()
     log_time = now.strftime("%Y_%-m_%-d_%-H_%-M_%-S")
     log_time += "_" + model_path
     full_path = os.path.join(root_path, log_time)
-    os.mkdir(full_path)
+    os.makedirs(full_path, exist_ok=True)
     opt.log_path = full_path
     save_opt(opt.log_path, opt)
     return opt.log_path

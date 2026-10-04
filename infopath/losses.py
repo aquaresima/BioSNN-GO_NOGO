@@ -556,8 +556,13 @@ def trial_matching_loss(
     trial_loss_exc_specific=False,
     feat_svd=False,
     dim=10,
+    stims=None,
 ):
     """Here we actually calculate the trial-matching loss function
+
+    If `stims` (stimulus 0/1 of every model trial) is given, the matching is stratified: model trials
+    are only compared with data trials of the same stimulus (session_info[1]), one loss term per
+    (session, stimulus) group. Without it, matching ignores the stimulus (original behaviour).
 
     Args:
         filt_data_all (torch.tensor): filtered data spikes
@@ -605,23 +610,68 @@ def trial_matching_loss(
                 trial_loss_area_specific=trial_loss_area_specific,
                 trial_loss_exc_specific=trial_loss_exc_specific,
             )
-        min_trials = min(feat_model.shape[0], feat_data.shape[0])
-        feat_data = feat_data[torch.randperm(feat_data.shape[0])[:min_trials]]
-        feat_model = feat_model[torch.randperm(feat_model.shape[0])[:min_trials]]
-        if len(feat_data) == 0:
-            continue
-        # apply the proper scaling depending the method
-        scaling = 1
-        if loss_fun.__dict__ != {}:
-            if loss_fun.loss != "energy":
-                scaling = feat_data.shape[1]
-            if loss_fun.p == 1:
-                scaling = scaling**0.5
-            scaling = feat_data.shape[1] ** 0.5
-        loss += loss_fun(feat_data, feat_model) / scaling
-        sessions += 1
+        if stims is None:
+            groups = [(feat_data, feat_model)]
+        else:
+            data_stim = torch.as_tensor(session_info[1][session]).to(feat_data.device)
+            model_stim = torch.as_tensor(stims).to(feat_model.device)
+            assert data_stim.shape[0] == feat_data.shape[0], "session_info stims do not match the data trials"
+            assert model_stim.shape[0] == feat_model.shape[0], "stims do not match the model trials"
+            groups = [
+                (feat_data[data_stim == g], feat_model[model_stim == g]) for g in (0, 1)
+            ]
+        for fd, fm in groups:
+            min_trials = min(fm.shape[0], fd.shape[0])
+            if min_trials == 0:
+                continue
+            fd = fd[torch.randperm(fd.shape[0])[:min_trials]]
+            fm = fm[torch.randperm(fm.shape[0])[:min_trials]]
+            # apply the proper scaling depending the method
+            scaling = 1
+            if loss_fun.__dict__ != {}:
+                if loss_fun.loss != "energy":
+                    scaling = fd.shape[1]
+                if loss_fun.p == 1:
+                    scaling = scaling**0.5
+                scaling = fd.shape[1] ** 0.5
+            loss += loss_fun(fd, fm) / scaling
+            sessions += 1
     loss /= sessions
     return loss
+
+
+def data_stim_tensor(session_info, n_trials, n_neurons, device):
+    """Stimulus (0/1) of every data trial, per neuron: (trials, neurons), -1 where the neuron's session has no such trial.
+
+    Data trial k of session s belongs to session_info[1][s][k]; neurons of the session are session_info[-1][s].
+    """
+    out = torch.full((n_trials, n_neurons), -1, dtype=torch.long, device=device)
+    for sess, idx in enumerate(session_info[-1]):
+        st = torch.as_tensor(session_info[1][sess]).long().to(device)
+        mask = torch.as_tensor(idx).bool().to(device)
+        sub = out[: st.shape[0]]
+        sub[:, mask] = st[:, None].expand(-1, int(mask.sum()))
+    return out
+
+
+def stratified_psth_loss(f_data, f_model, data_stim, model_stim):
+    """Neuron-wise PSTH loss computed separately for the GO and NO-GO stimulus.
+
+    f_data  (T, data trials, neurons), NaN where the neuron's session has no trial
+    f_model (T, model trials, neurons)
+    data_stim (data trials, neurons) from data_stim_tensor; model_stim (model trials,)
+    Normalisation (mean/std per neuron) comes from the all-trial data PSTH, so the GO/NO-GO difference is kept.
+    """
+    all_mean = f_data.nanmean(1)
+    mean = all_mean.mean(0)
+    std = all_mean.std(0).clip(1e-3)
+    loss = 0
+    for g in (0, 1):
+        in_g = (data_stim == g)[None]  # (1, trials, neurons)
+        d = torch.where(in_g, f_data, torch.full_like(f_data, float("nan"))).nanmean(1)
+        m = f_model[:, model_stim == g].nanmean(1)
+        loss = loss + torch.nanmean(((m - mean) / std - (d - mean) / std) ** 2)
+    return loss / 2
 
 
 def kl_loss(mu, log_var):

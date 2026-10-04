@@ -7,9 +7,10 @@ import copy
 def build_network(
     rsnn,
     datapath,
-    area_list=["wS1", "wS2", "wM1", "wM2", "ALM", "tjM1"],
+    area_list=["ALM", "AC"],
     with_video=True,
     hidden_propability=0.0,
+    spread_sessions=False,
 ):
     """
     Build the network based on the data collected from the dataset and based on the array
@@ -66,17 +67,51 @@ def build_network(
         for area in area_list
     ]
     sess_inh = copy.deepcopy(sess_exc)
+
+    planned = None
+    if spread_sessions:
+        # "collage" over all sessions of an area: the model neurons of every (area, E/I) group are split over the
+        # sessions in proportion to how many neurons of that group each session has (largest remainder), instead
+        # of filling the biggest session first. Every session then constrains the model with its own trials.
+        planned = np.empty(n_neurons, dtype=object)
+        for area_id, area_name in enumerate(area_list):
+            for exc_flag in (True, False):
+                slots = [
+                    i
+                    for i in range(n_neurons)
+                    if int(rsnn.area_index[i]) == area_id
+                    and bool(rsnn.excitatory_index[i]) == exc_flag
+                ]
+                avail = clusterdf[
+                    (clusterdf["area"] == area_name)
+                    & (clusterdf["excitatory"] == exc_flag)
+                    & (clusterdf["session"].isin(sessions_uniq))
+                ].session.value_counts()
+                if len(slots) == 0:
+                    continue
+                assert avail.sum() >= len(slots), "not enough neurons in the dataset"
+                share = avail.values / avail.values.sum() * len(slots)
+                counts = np.minimum(np.floor(share).astype(int), avail.values)
+                rest = len(slots) - counts.sum()
+                for j in np.argsort(-(share - np.floor(share)))[:rest]:
+                    counts[j] += 1
+                names = np.repeat(avail.index.values, counts)
+                planned[slots] = names[np.random.permutation(len(names))]
     # in this loop we make the matching from recordings to simulations
     for i in range(n_neurons):
         exc = rsnn.excitatory_index[i].numpy()
         area_id = rsnn.area_index[i]
         area = area_list[area_id]
         cur_session = sess_exc[area_id] if exc else sess_inh[area_id]
+        if planned is not None:
+            cur_session = np.array([planned[i]])
+
         possible_ids = clusterdf[
             (clusterdf["area"] == area)
             & (clusterdf["excitatory"] == exc)
             & (clusterdf["session"] == cur_session[0])
         ]
+
         # making sure that we use all neurons from a session and then move to the next session
         while possible_ids.shape[0] == 0 and area != "Nope":
             cur_session = cur_session[1:]
@@ -117,3 +152,4 @@ def build_network(
             areas[i] = clusterdf.area[clusterdf.index == index].values[0]
             clusterdf = clusterdf[clusterdf.index != index]
     return neuron_index, firing_rate, session, areas
+

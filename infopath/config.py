@@ -82,29 +82,38 @@ def log(x):
 def get_default_opt():
     input_parameters = {
         # duration of stimulus in seconds
-        "stim_duration": 0.01,
+        "stim_duration": 2,
         # Frequency in Hz of the input neurons
         "input_f0": 2.0,
         # Number of inputs to the RNNs
-        "n_rnn_in": 128,
+        "n_rnn_in": 3,      # Before 128
         # function to scale differnt stim amplitudes, it can be {'sigmoid', 'linear', 'log'}
         "scale_fun": "log",
         # valance of the stimulus, multiplier of scale_fun
         "stim_valance": 11.5,
         # delay from input to rnn in seconds
         "thalamic_delay": 0.005,
+        # decay velocity
+        "tau_sound_decay": 0.5,
+        # areas (names from `areas`) that receive the sensory input; None = all areas
+        "input_areas": None,
+        "spread_sessions": False,
+        "cue_input": False,
+        "cue_time": 4.0,
+        "cue_duration": 0.1,
+        "cue_areas": None,
     }
     optimizer_parameters = {
         # learning rate
-        "lr": 0.0003,
+        "lr": 0.0005,
         # weight decay
         "w_decay": 0.01,
         # l1 decay
-        "l1_decay": 0.01,
+        "l1_decay": 0.00,
         # maximum iteration before stopping the early stopping
         "early_stop": 2000,
         # wheter to penalize across area connections
-        "l1_decay_across": 0.001,
+        "l1_decay_across": 0.02,
         # a different way to implement sparsity (this might be better in the future)
         "iterative_pruning": False,
     }
@@ -112,13 +121,14 @@ def get_default_opt():
         #  how many neurons
         "n_units": 300,
         # how strong is the membrane potential noise, in each area
-        "noise_level_list": [0.16, 0.16, 0.16],
+        "noise_level_list": [0.16, 0.16],
         # timeconstant of membrane potential of areas in ms
-        "tau_list": [10.0, 10.0, 10.0],
+        "tau_list": [10.0, 10.0],
         # timeconstant of adaptative threshold in ms
         "tau_adaptation": 144.0,
         # name of areas
-        "areas": ["wS1", "mPFC", "tjM1"],
+        #"areas": ["wS1", "mPFC", "tjM1"],
+        "areas": ["ALM", "AC"],
         # smallest synaptic delay
         "n_delay": 5,
         # longest synaptic delay
@@ -128,7 +138,7 @@ def get_default_opt():
         # start and endpoint for reaction_time limits defaults none values
         "reaction_time_limits": None,
         # which areas project to motor decoder
-        "motor_areas": [],
+        "motor_areas": ["ALM"],
         # maximum delay for neural activity to generate jaw/tongue
         "jaw_delay": 40,
         # min delay for neural activity to generate jaw/tongue
@@ -140,7 +150,7 @@ def get_default_opt():
         # propability a neuron to be adaptive
         "prop_adaptive": 0.0,
         # spike function type {"bernoulli", "deterministic"}
-        "spike_function": "bernoulli",
+        "spike_function": "wulfram",
         # train bias (offset in the v_{rest})
         "train_bias": False,
         # train bias(a multiplicative factor in the membrane noise)
@@ -171,7 +181,7 @@ def get_default_opt():
         # if to scale the jaw/tongue in the model
         "scaling_jaw_in_model": False,
         # percentage of exc neurons in input neurons
-        "p_exc_in": 0.8,
+        "p_exc_in": 0.9,
         # what is the initial v_{rest} values
         "v_rest": 0,
         # what is the initial threshold values
@@ -197,9 +207,9 @@ def get_default_opt():
     }
     training_parameters = {
         # how often to log
-        "log_every_n_steps": 100,
+        "log_every_n_steps": 50,
         # batch size
-        "batch_size": 50,
+        "batch_size": 200,
         # Number of training steps
         "n_steps": 20000,
         # how impact has the main loss to the total loss
@@ -240,6 +250,7 @@ def get_default_opt():
     general_parameters = {
         # directory of the dataset
         "datapath": "./datasets",
+        #"datapath": "./pierre/data",
         # Device to use {either cpu or cuda:0}
         "device": "cuda:0" if torch.cuda.is_available() else "cpu",
         # gauss std for filtering spikes beforer loss calculation in ms
@@ -265,7 +276,8 @@ def get_default_opt():
         # Onset of trial in seconds
         "trial_onset": 1.0,
         # what are the stimuli onsets in seconds
-        "stim_onsets": [0, 1],
+        #"stim_onsets": [0, 1],
+        "stim_onsets": [0.0],
         # Timestep of simulation in ms
         "dt": 1.0,
         # more readable way to set stim
@@ -336,7 +348,7 @@ def config_pseudodata():
     opt.thalamic_delay = 0.004  # * (opt.lsnn_version != "srm")
     opt.tau_list = [10 for i in range(opt.num_areas)]
     opt.exc_inh_tau_mem_ratio = 3.0
-    opt.stim_onsets = [0]
+    opt.stim_onsets = [0.0]
 
     opt.restrict_inter_area_inh = True
     opt.dt = 4
@@ -368,7 +380,7 @@ def config_pseudodata():
     opt.lr = 0.001
     opt.p_exc = 0.8
     opt.trial_loss_area_specific = True
-    opt.geometric_loss = False
+    opt.geometric_loss = True
     opt.motor_areas = []
     opt.jaw_delay = 40
     opt.tau_jaw = 50
@@ -396,31 +408,56 @@ def config_pseudodata():
 # # Vahid
 def config_vahid():
     opt = get_default_opt()
-    opt.datapath = "./datasets/DataFromVahid_expert"
-    opt.areas = ["wS1", "wS2", "wM1", "wM2", "ALM", "tjM1"]
+    #opt.datapath = "./datasets/DataFromVahid_expert"
+    opt.datapath = os.environ.get("BIOINFO_DATAPATH", "./datasets/Pierre_v2")
+    #opt.areas = ["wS1", "wS2", "wM1", "wM2", "ALM", "tjM1"]
+    opt.areas = ["ALM", "AC"]
     opt.num_areas = len(opt.areas)
     opt.stim = [0, 1]
-    opt.n_units = 750
-    opt.n_rnn_in = 2
-    opt.start, opt.stop = -0.2, 1.2
+    opt.n_units = 1000
+    opt.n_rnn_in = 4  # constant, GO, NO-GO, response-window cue
+    # Pierre sessions store trial_onset = sound onset (pierre/process.py), so the loader window
+    # must be relative to it: trial_onset=0. The Vahid-era default (1.0) shifted the data by 1 s
+    # against the model input. stop=4.7 covers sound (0-2 s), delay (2-4 s) and the first 0.7 s of the response window (lick activity saturates by about 4.5 s).
+    opt.trial_onset = 0.0
+    opt.online_logging = True  # Comet; no-op if comet_ml or the API key is missing
+    opt.online_project = "biosnn-go-nogo"
+    opt.input_areas = ["AC"]  # sound enters through the auditory cortex only
+    # Match model trials to data trials of the same stimulus only (GO with GO, NO-GO with NO-GO), and
+    # compute the neuron-wise PSTH loss per stimulus. Without it the losses ignore the stimulus and the
+    # model learned an arbitrary (inverted) GO/NO-GO mapping.
+    opt.stratify_stim = True
+    # Response-window cue: the recordings show a large burst at 4.0 s in both areas on every trial, but the
+    # model had no input after the sound (0-2 s). One extra channel, a 0.1 s pulse at 4.0 s, to ALM and AC.
+    # Session collage (as in the paper): spread each area's neurons over all its sessions; without it the
+    # sampler fills the biggest session first and uses one session per area (500 neurons each here).
+    opt.spread_sessions = True
+    opt.cue_input = True
+    opt.cue_time = 4.0
+    opt.cue_duration = 0.1
+    opt.cue_areas = ["ALM", "AC"]
+    opt.start, opt.stop = -0.2, 4.7
     opt.noise_level_list = [0.10 for i in range(len(opt.areas))]
 
     opt.prop_adaptive = 0.0
     opt.input_f0 = 5
     opt.tau_list = [10 for i in range(opt.num_areas)]
 
-    opt.dt = 4
+    opt.dt = 2
     opt.inter_delay = 4  # miliseconds
-    opt.n_delay = 4
+    opt.n_delay = 2
     opt.rec_groups = 1
 
-    opt.psth_filter = 8  # miliseconds # int(psth_filter / opt.dt)
+    opt.psth_filter = 12  # miliseconds # int(psth_filter / opt.dt)
     opt.lsnn_version = "simplified"
     opt.thalamic_delay = 0.004  # * (opt.lsnn_version != "srm")
     opt.early_stop = 8000
     opt.lr = 1e-3
-    opt.p_exc = 0.8
-    opt.p_exc_in = 1
+    # p_exc: data excitatory fraction is 0.90 (ALM) / 0.94 (AC); the report Annex says 0.90.
+    # p_exc_in must be 1: input channels i >= int(p_exc_in * n_rnn_in) are INHIBITORY (rsnn.n_exc_inp), so with
+    # 0.85 or 0.9 and 3 channels the NO-GO channel inhibited its targets. Upstream config_vahid uses 1.
+    opt.p_exc = 0.90
+    opt.p_exc_in = 1.0
     opt.batch_size = 150
 
     opt.loss_neuron_wise = 1
@@ -447,25 +484,26 @@ def config_vahid():
     opt.trial_loss_area_specific = True
     opt.geometric_loss = True
 
-    opt.motor_areas = [4, 5]
-    opt.jaw_delay = 40
+    opt.motor_areas = [0]
+    opt.jaw_delay = 16
     opt.jaw_min_delay = 12
-    opt.tau_jaw = 50
+    opt.tau_jaw = 5
     opt.jaw_version = 1
 
     opt.gan_loss = False
     opt.gan_hidden_neurons = 128
     opt.latent_new = False
     opt.with_behaviour = True
+    opt.with_behaviour = False
     # opt.device = "cpu"
-    opt.reaction_time_limits = [-1, 0.3]
+    #opt.reaction_time_limits = [-1, 0.3]
     opt.with_task_splitter = True
     opt.z_score = True
     opt.jaw_open_loop = True
     opt.scaling_jaw_in_model = True
     opt.jaw_tongue = 1
     opt.jaw_nonlinear = False
-    opt.temperature = 1
+    opt.temperature = 5
     opt.v_rest = 0  # -75  #
     opt.thr = 0.1  # -50  #
     opt.trial_offset_bound = False
@@ -489,14 +527,22 @@ def get_opt(log_path=None):
 if __name__ == "__main__":
     parser = OptionParser()
     parser.add_option("--config", type="string", default="none")
+    parser.add_option("--n_steps", type="int", default=None)
+    parser.add_option("--n_units", type="int", default=None)
+    parser.add_option("--batch_size", type="int", default=None)
+    parser.add_option("--log_every_n_steps", type="int", default=None)
+    parser.add_option("--eval_batch_size", type="int", default=None)
     (pars, _) = parser.parse_args()
 
     config_path = os.path.join("configs", pars.config)
-    if ~os.path.exists(config_path):
-        os.mkdir(config_path)
+    os.makedirs(config_path, exist_ok=True)
 
     default = get_default_opt()
     opt = copy.copy(default)
-    # opt = config_vahid()
-    opt = config_pseudodata()
+    opt = config_vahid()
+    # opt = config_pseudodata()
+    for key in ("n_steps", "n_units", "batch_size", "log_every_n_steps", "eval_batch_size"):
+        if getattr(pars, key) is not None:
+            setattr(opt, key, getattr(pars, key))
     save_opt(config_path, opt)
+

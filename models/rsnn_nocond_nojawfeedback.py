@@ -69,6 +69,9 @@ class RSNN(nn.Module):
         weights_random_delays=False,
         seed=0,
         with_reset=True,
+        input_areas=None,
+        cue_channels=0,
+        cue_areas=None,
     ):
         """The module for the RSNN. In this function the 2 most complicated parts are: 1. the initialization and the reforming
         of the weight matrices, in order to keep the excitatory and inhibitory neuron types, and, 2. the time simulation in
@@ -218,12 +221,27 @@ class RSNN(nn.Module):
 
         # make input weight matrix
         weights_in = self.make_input_weight_matrix(p_inpe, p_inpi, self.p_exc_in)
+        # restrict the sensory input to neurons of the given areas (indices into `areas`)
+        # sound channels reach `input_areas`; the last `cue_channels` channels reach `cue_areas` (default: all areas)
+        input_blocked = torch.zeros(self.n_units, self.input_size, dtype=torch.bool)
+        n_sound = self.input_size - cue_channels
+        if input_areas is not None:
+            input_blocked[:, :n_sound] = (
+                ~torch.isin(self.area_index, torch.as_tensor(input_areas))
+            )[:, None]
+        if cue_channels and cue_areas is not None:
+            input_blocked[:, n_sound:] = (
+                ~torch.isin(self.area_index, torch.as_tensor(cue_areas))
+            )[:, None]
+        weights_in = weights_in * (~input_blocked)
         self.n_exc_inp = int(p_exc_in * self.input_size)
         if train_input_weights:
             self._w_in = Parameter(weights_in * (thr - v_rest) / 0.1)
         else:
             self.register_buffer("_w_in", weights_in * (thr - v_rest) / 0.1)
+        # pruned entries are re-zeroed by reform_w_in at every step, so blocked rows stay at 0
         self.mask_prune_w_in = torch.zeros_like(self._w_in)
+        self.mask_prune_w_in[input_blocked] = 1
         # make reccurent weight matrix
         self.rec_groups = rec_groups
         weights, mask = [], []

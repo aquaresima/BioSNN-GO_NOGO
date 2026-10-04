@@ -1,6 +1,7 @@
 from infopath.session_stitching import build_network
 from models.pop_rsnn import PopRSNN
 from datasets.prepare_input import InputSpikes
+from datasets.prepare_input import InputSpikes_Adapted
 import numpy as np
 import torch.nn as nn
 import torch
@@ -20,10 +21,12 @@ class FullModel(nn.Module):
         self.opt = opt
         self.num_areas = opt.num_areas
         self.rsnn = init_rsnn(opt)
-        self.input_spikes = InputSpikes(opt)
+        #self.input_spikes = InputSpikes(opt)
+        self.input_spikes = InputSpikes_Adapted(opt)
         start, stop = self.opt.start, self.opt.stop
         self.opt.start, self.opt.stop = 0.0, 0.1
-        self.input_spikes_pre = InputSpikes(copy.deepcopy(opt))
+        #self.input_spikes_pre = InputSpikes(copy.deepcopy(opt))
+        self.input_spikes_pre = InputSpikes_Adapted(copy.deepcopy(opt))
         self.opt.start, self.opt.stop = start, stop
         self.timestep = self.opt.dt * 0.001
         self.trial_onset = -int(self.opt.start / self.timestep)
@@ -178,6 +181,7 @@ class FullModel(nn.Module):
         data_jaw,
         session_info,
         netD,
+        stims=None,
     ):
         """Calculates the generator loss (in the no GAN like cases is the only/classic loss), if there are multiple loss
         they are weighted with the loss spliter to ensure that their gradients have comparable scales.
@@ -194,6 +198,8 @@ class FullModel(nn.Module):
             torch.float: Total loss
         """
         count_tasks = 0  # useful for the the loss_splitter
+        # stimulus-stratified matching: model GO trials are compared only with data GO trials (opt.stratify_stim)
+        stims = stims if getattr(self.opt, "stratify_stim", False) else None
         with_jaw = -1 if len(self.opt.motor_areas) > 0 else None
         if self.opt.with_task_splitter:
             if len(self.opt.motor_areas) > 0:
@@ -253,7 +259,12 @@ class FullModel(nn.Module):
             f_data = filt_data[:, :, self.neuron_index != -1]
             f_model = filt_model[:, :, self.neuron_index != -1]
             psth_model, psth_data, f_model_norm = z_score_norm(f_data, f_model)
-            if self.opt.stats_loss:
+            if stims is not None:
+                data_stim = data_stim_tensor(
+                    session_info, f_data.shape[1], filt_data.shape[2], f_data.device
+                )[:, self.neuron_index != -1]
+                neur_loss += stratified_psth_loss(f_data, f_model, data_stim, stims.to(f_model.device))
+            elif self.opt.stats_loss:
                 correction_term = f_model_norm.var(1).mean() / f_model_norm.shape[1]
                 neur_loss += ((psth_model - psth_data) ** 2).mean() - correction_term
             else:
@@ -318,6 +329,7 @@ class FullModel(nn.Module):
                     trial_loss_area_specific=self.opt.trial_loss_area_specific,
                     trial_loss_exc_specific=self.opt.trial_loss_exc_specific,
                     feat_svd=False,
+                    stims=stims,
                 )
                 if self.opt.feat_svd:
                     trial_loss += (
@@ -405,7 +417,8 @@ def load_model_and_optimizer(opt, reload=False, last_best="last", reload_optim=T
     else:
         np.random.seed(opt.seed)
         neuron_index, firing_rate, session, area = build_network(
-            model.rsnn, opt.datapath, opt.areas, opt.with_behaviour, opt.hidden_perc
+            model.rsnn, opt.datapath, opt.areas, opt.with_behaviour, opt.hidden_perc,
+            spread_sessions=getattr(opt, "spread_sessions", False),
         )
         model.neuron_index = neuron_index
         model.firing_rate = firing_rate
@@ -468,6 +481,13 @@ def init_rsnn(opt):
     else:
         from models.rsnn_nocond_nojawfeedback import RSNN
 
+    input_areas = getattr(opt, "input_areas", None)
+    if input_areas is not None:
+        input_areas = [opt.areas.index(a) for a in input_areas]
+    cue_channels = 1 if getattr(opt, "cue_input", False) else 0
+    cue_areas = getattr(opt, "cue_areas", None)
+    if cue_areas is not None:
+        cue_areas = [opt.areas.index(a) for a in cue_areas]
     if opt.lsnn_version == "simplified":
         rsnn = RSNN(
             opt.n_rnn_in,
@@ -512,6 +532,9 @@ def init_rsnn(opt):
             p_ii=opt.p,
             weights_random_delays=opt.weights_random_delays,
             with_reset=opt.with_reset,
+            input_areas=input_areas,
+            cue_channels=cue_channels,
+            cue_areas=cue_areas,
         )
     elif opt.lsnn_version == "mlp":
         T = int((opt.stop - opt.start) / opt.dt * 1000)
@@ -710,3 +733,4 @@ def seed(seed=1810):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
