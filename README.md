@@ -18,8 +18,8 @@ and has been adapted to a different dataset and task. What changed with respect 
 
 - **Task.** Each trial has a 2 s sound (GO or NO-GO), a 2 s silent delay, and a response window that opens at 4 s when the lick port arrives.
   The mouse licks for GO trials (Hit) and withholds for NO-GO trials (Correct Rejection); errors are Miss and False Alarm.
-- **Data.** Neuropixels recordings in NWB format, one area per session (6 ALM and 5 AC sessions). **The recordings are not part of this repository
-  and are not distributed with it.** `pierre/process.py` documents the format it expects (spike times, trial table, lick sensor, sound copy).
+- **Data.** Neuropixels recordings in NWB format, one area per session (several ALM and several AC sessions). **The recordings are not part of this
+  repository and are not distributed with it.** `pierre/process.py` documents the format it expects (spike times, trial table, lick sensor, sound copy).
 - **Model.** 1000 units (500 per area, 90% excitatory), four input channels (constant, GO, NO-GO, and a response-window cue at 4 s), recurrent
   spiking dynamics with surrogate gradients, trained with a neuron-wise PSTH loss and a trial-matching (optimal transport) loss, both computed
   per stimulus.

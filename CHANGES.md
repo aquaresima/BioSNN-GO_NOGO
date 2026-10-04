@@ -49,8 +49,8 @@ Origin of each change: **[A]** first adaptation to the GO/NO-GO data (internship
 ## 4. Session stitching
 
 - The sampling code (`infopath/session_stitching.py`) is the original: it fills a model area from the biggest session first and moves to the next session
-  only when it runs out. With small sessions this gives a collage over many sessions; with the large sessions of this dataset (417 to 1084 neurons per session
-  against 500 model units per area) it uses a single session per area.
+  only when it runs out. With small sessions this gives a collage over many sessions; with the large sessions of this dataset (each larger than the number
+  of model units per area) it uses a single session per area.
 - **[B] `spread_sessions` option (on in `config_vahid`)**: the neurons of each (area, excitatory/inhibitory) group are split over all sessions of the area in
   proportion to session size, so that every session constrains the model with its own trials. Neuron identity, area and cell type are preserved. The
   assignment is made once, when the model is built, and saved in the run folder.

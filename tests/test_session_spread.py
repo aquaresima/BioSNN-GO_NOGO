@@ -14,7 +14,8 @@ exc = model.rsnn.excitatory_index.numpy(); aidx = model.rsnn.area_index.numpy()
 for a, an in enumerate(opt.areas):
     print(an, {k[:15]: int(v) for k, v in pd.Series(sess[aidx == a]).value_counts().sort_index().items()})
 n_sessions = {an: len(set(sess[aidx == a])) for a, an in enumerate(opt.areas)}
-assert n_sessions == {"ALM": 6, "AC": 5}, n_sessions
+expected = {an: int(cl[cl.area == an].session.nunique()) for an in opt.areas}
+assert n_sessions == expected, (n_sessions, expected)
 keys = list(zip(sess, ni.astype(int)))
 assert len(set(keys)) == len(keys), "a recorded neuron was used twice"
 for i in range(1000):                      # E/I label and area of the model unit equal the recorded neuron's
